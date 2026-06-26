@@ -447,15 +447,23 @@ def is_alt_a2dp_installed() -> bool:
         return False
 
 
+def _canonical_mac_hex(mac_hex: str) -> str:
+    """Single canonical form for the 'mac_raw' cache-key string used
+    throughout this module: lowercase, truncated to the last 12 hex chars.
+    Both _normalize_mac_raw and extract_mac_raw must produce identical
+    output for a given physical MAC or cache lookups silently miss forever
+    (battery showed "Not reported" for fast-path-detected devices because
+    these two were once separate, divergent implementations)."""
+    mac_hex = mac_hex.lower()
+    return mac_hex[-12:] if len(mac_hex) > 12 else mac_hex
+
+
 def _normalize_mac_raw(mac_raw: str) -> str:
     """Registry key names are sometimes zero-padded to 16 hex chars (matching
     the Current\\{mac} key format), while extract_mac_raw() (used by the slow
     PowerShell loop, via InstanceId regex) always produces the real 12-char
-    MAC. Without normalizing both to the same form, the fast path's mac_raw
-    never matches the battery cache key set by the slow loop — battery always
-    showed "Not reported" for fast-path-detected devices because of this."""
-    mac_raw = mac_raw.lower()
-    return mac_raw[-12:] if len(mac_raw) > 12 else mac_raw
+    MAC — both go through _canonical_mac_hex() to guarantee they match."""
+    return _canonical_mac_hex(mac_raw)
 
 
 def get_known_devices_with_mac() -> list[tuple[str, str]]:
@@ -554,15 +562,16 @@ def _search_device_image_url(device_name: str) -> str | None:
     image URL found, or None.
     """
     query = f"{device_name} bluetooth product photo"
-    
-    # Extract likely brand from the first word of the device name
-    brand = device_name.split()[0].lower()
-    
-    # Reputable domains to verify against (includes the brand itself)
+
+    # Fixed allowlist of known review/retail sites only — deliberately does NOT
+    # include anything derived from device_name (which ultimately comes from a
+    # Bluetooth FriendlyName that any nearby device can advertise), since that
+    # would let an attacker-controlled device name add itself to the trusted
+    # set and steer which "verified" source URLs get accepted.
     reputable_domains = [
-        brand, "rtings.com", "soundguys.com", "head-fi.org", "whathifi.com",
+        "rtings.com", "soundguys.com", "head-fi.org", "whathifi.com",
         "techradar.com", "theverge.com", "cnet.com", "tomsguide.com",
-        "amazon.", "bestbuy.com", "gsmarena.com", "scarbir.com"
+        "amazon.com", "bestbuy.com", "gsmarena.com",
     ]
 
     try:
@@ -623,7 +632,7 @@ def get_windows_paired_bt_names() -> list[str]:
         return []
 
 def get_history_seen_device_names() -> list[str]:
-    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn = sqlite3.connect(HISTORY_DB_PATH, timeout=10)
     try:
         rows = conn.execute(
             "SELECT DISTINCT device FROM history WHERE device IS NOT NULL AND type = 'bluetooth'"
@@ -650,7 +659,7 @@ def get_all_known_device_names() -> list[str]:
     return names
 
 def get_last_known_battery(device_name: str):
-    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn = sqlite3.connect(HISTORY_DB_PATH, timeout=10)
     try:
         row = conn.execute(
             "SELECT battery FROM history WHERE device = ? AND battery IS NOT NULL "
@@ -765,9 +774,15 @@ def fetch_photo_for_device(device_name: str):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "CodecMonitor/1.0"})
             with urllib.request.urlopen(req, timeout=8) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                if not content_type.startswith("image/"):
+                    print(f"  Photo fetch rejected for {device_name}: non-image Content-Type '{content_type}'")
+                    return
                 data = resp.read(2 * 1024 * 1024)
             if len(data) > 500:
-                dest.write_bytes(data)
+                tmp = dest.with_suffix(dest.suffix + ".tmp")
+                tmp.write_bytes(data)
+                os.replace(tmp, dest)
                 print(f"  Photo cached: {dest.name} ({len(data)} bytes)")
         except Exception as e:
             print(f"  Photo fetch failed for {device_name}: {e}")
@@ -787,7 +802,7 @@ def prefetch_photos():
 # ---------- History (in-memory + SQLite) + Alerts ----------
 
 def init_history_db():
-    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn = sqlite3.connect(HISTORY_DB_PATH, timeout=10)
     try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS history (
@@ -830,7 +845,7 @@ def get_history():
 def load_recent_history_into_memory():
     """On startup, pull recent rows from SQLite so the timeline isn't empty."""
     since = time.time() - HISTORY_LOAD_HOURS * 3600
-    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn = sqlite3.connect(HISTORY_DB_PATH, timeout=10)
     try:
         rows = conn.execute(
             "SELECT t, device, mac, codec, bitrate, battery, type FROM history "
@@ -856,7 +871,7 @@ def flush_history_to_db():
             return
         rows = list(_pending_history_rows)
         _pending_history_rows.clear()
-    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn = sqlite3.connect(HISTORY_DB_PATH, timeout=10)
     try:
         conn.executemany(
             "INSERT INTO history (t, device, mac, codec, bitrate, battery, type) "
@@ -871,7 +886,7 @@ def flush_history_to_db():
 def prune_history_db():
     retention_days = get_settings()["history_retention_days"]
     cutoff = time.time() - retention_days * 86400
-    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn = sqlite3.connect(HISTORY_DB_PATH, timeout=10)
     try:
         conn.execute("DELETE FROM history WHERE t < ?", (cutoff,))
         conn.commit()
@@ -953,7 +968,7 @@ def export_history_pdf(mac: str | None = None, since_epoch: float | None = None)
 
 
 def query_history_rows(mac: str | None = None, since_epoch: float | None = None) -> list[dict]:
-    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn = sqlite3.connect(HISTORY_DB_PATH, timeout=10)
     try:
         query = "SELECT t, device, mac, codec, bitrate, battery, type FROM history WHERE 1=1"
         params = []
@@ -974,7 +989,7 @@ def query_history_rows(mac: str | None = None, since_epoch: float | None = None)
 
 
 def compute_bitrate_stats(mac: str | None = None, since_epoch: float | None = None) -> dict:
-    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn = sqlite3.connect(HISTORY_DB_PATH, timeout=10)
     try:
         query = "SELECT MIN(bitrate), AVG(bitrate), MAX(bitrate), COUNT(*) FROM history WHERE bitrate IS NOT NULL"
         params = []
@@ -1248,13 +1263,14 @@ def start_endpoints_poller():
 # ---------- Data processing ----------
 
 def extract_mac_raw(instance_id: str) -> str | None:
-    """Extract raw 12-char hex MAC from instance ID, lowercased so it matches
-    the registry-derived mac_raw form everywhere else (_normalize_mac_raw,
-    read_alt_a2dp_current) — InstanceId strings have it uppercase, and the
-    battery cache is a plain dict keyed by this string, so a case mismatch
-    here means lookups silently miss forever."""
+    """Extract raw 12-char hex MAC from instance ID, normalized via
+    _canonical_mac_hex() so it matches the registry-derived mac_raw form
+    everywhere else (_normalize_mac_raw, read_alt_a2dp_current) — InstanceId
+    strings have it uppercase, and the battery cache is a plain dict keyed
+    by this string, so a case mismatch here means lookups silently miss
+    forever."""
     m = re.search(r"([0-9A-Fa-f]{12})", instance_id or "")
-    return m.group(1).lower() if m else None
+    return _canonical_mac_hex(m.group(1)) if m else None
 
 
 def format_mac(mac_12: str) -> str:
@@ -1292,6 +1308,39 @@ def classify_endpoint(name: str, bt_device_names: list) -> str:
 
 
 _alt_a2dp_installed = None
+
+
+def _name_match_score(a: str, b: str) -> int | None:
+    """Score how well two device/endpoint names fuzzy-match each other.
+    Returns None if they don't match at all; otherwise higher = more
+    specific. Exact (base-name) equality scores highest, and substring
+    matches are scored by the shorter string's length so that, when picking
+    among several candidates, the most specific one wins instead of
+    whichever happens to come first — e.g. two paired devices "Buds" and
+    "Buds Pro" no longer get each other's battery/codec mixed up just
+    because "Buds" is a substring of "Buds Pro"."""
+    a_l, b_l = a.lower(), b.lower()
+    a_base = a_l.split(" (")[0]
+    b_base = b_l.split(" (")[0]
+    if a_base == b_base:
+        return 1_000_000
+    if a_l in b_l or b_l in a_l:
+        return min(len(a_l), len(b_l))
+    if a_base in b_l or b_base in a_l:
+        return min(len(a_base), len(b_base))
+    return None
+
+
+def _best_name_match(target: str, candidates: list, name_key=lambda x: x):
+    """Pick the candidate whose name is the most specific fuzzy match for
+    target (see _name_match_score), or None if nothing matches."""
+    best, best_score = None, None
+    for c in candidates:
+        score = _name_match_score(target, name_key(c))
+        if score is not None and (best_score is None or score > best_score):
+            best, best_score = c, score
+    return best
+
 
 def build_snapshot_from_raw(raw: dict) -> dict:
     global _current_device_name, _device_connect_time, _alt_a2dp_installed
@@ -1347,10 +1396,7 @@ def build_snapshot_from_raw(raw: dict) -> dict:
         mac_raw = fast_hit["mac_raw"]
         bt_name = fast_hit["name"]
         codec = fast_hit["codec"]
-        matched_ep = next(
-            (e for e in bt_endpoints if bt_name.lower() in e["name"].lower() or e["name"].split(" (")[0].lower() in bt_name.lower()),
-            None,
-        )
+        matched_ep = _best_name_match(bt_name, bt_endpoints, name_key=lambda e: e["name"])
         active_ep = matched_ep or {"name": bt_name, "type": "bluetooth", "status": "OK"}
         matched_bt = {"Name": bt_name, "InstanceId": mac_raw, "Battery": get_cached_battery(mac_raw)}
     else:
@@ -1362,23 +1408,16 @@ def build_snapshot_from_raw(raw: dict) -> dict:
         candidates = bt_endpoints + hp_endpoints + spk_endpoints
         active_ep = None
         if default_name:
-            active_ep = next(
-                (e for e in candidates if e["name"].lower() in default_name.lower() or default_name.lower() in e["name"].lower()),
-                None,
-            )
+            active_ep = _best_name_match(default_name, candidates, name_key=lambda e: e["name"])
         if active_ep is None:
             active_ep = (bt_endpoints or hp_endpoints or spk_endpoints or [None])[0]
 
         if active_ep and active_ep["type"] == "bluetooth":
-            for d in bt_devices:
-                dev_name = d.get("Name", "")
-                if dev_name and dev_name.lower() in active_ep["name"].lower():
-                    matched_bt = d
-                    break
-                ep_base = active_ep["name"].split(" (")[0].lower()
-                if dev_name and ep_base in dev_name.lower():
-                    matched_bt = d
-                    break
+            matched_bt = _best_name_match(
+                active_ep["name"],
+                [d for d in bt_devices if d.get("Name")],
+                name_key=lambda d: d.get("Name", ""),
+            )
 
         # Trust Alt A2DP's live registry over Windows' PnP/endpoint status, which can take
         # tens of seconds to notice a real disconnect (Bluetooth supervision timeout).
@@ -1628,7 +1667,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             qs = urllib.parse.parse_qs(parsed.query)
             mac = qs.get("mac", [None])[0]
             since_hours = qs.get("since_hours", [None])[0]
-            since_epoch = time.time() - float(since_hours) * 3600 if since_hours else None
+            since_epoch = None
+            if since_hours:
+                try:
+                    since_epoch = time.time() - float(since_hours) * 3600
+                except ValueError:
+                    self.send_error(400, "Invalid since_hours")
+                    return
 
             if parsed.path == "/history":
                 rows = query_history_rows(mac=mac, since_epoch=since_epoch)
@@ -1660,8 +1705,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(body)
             return
         if self.path.startswith("/photos/"):
-            fname = self.path[len("/photos/"):]
-            fpath = PHOTOS_DIR / fname
+            fname = urllib.parse.unquote(self.path[len("/photos/"):].split("?")[0].split("#")[0])
+            photos_root = PHOTOS_DIR.resolve()
+            fpath = (photos_root / fname).resolve()
+            if fpath != photos_root and photos_root not in fpath.parents:
+                self.send_error(404)
+                return
             if fpath.exists() and fpath.is_file():
                 self.send_response(200)
                 ext = fpath.suffix.lower()
@@ -1676,7 +1725,31 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
+    def _is_trusted_origin(self) -> bool:
+        """Reject cross-origin POSTs (CSRF mitigation). pywebview's own
+        frontend requests are same-origin (no Origin header, or one matching
+        our own host:port); a malicious page loaded in some other browser
+        tab on the same machine would send a mismatching Origin/Referer."""
+        origin = self.headers.get("Origin") or self.headers.get("Referer")
+        if not origin:
+            return True
+        # Parse and compare scheme/hostname/port exactly — a substring/prefix
+        # check here would be bypassable by a malicious host like
+        # "127.0.0.1:8765.evil.com" or "127.0.0.1:87651".
+        try:
+            parsed = urllib.parse.urlparse(origin)
+            return (
+                parsed.scheme == "http"
+                and parsed.hostname in ("127.0.0.1", "localhost")
+                and parsed.port == PORT_HTTP
+            )
+        except ValueError:
+            return False
+
     def do_POST(self):
+        if not self._is_trusted_origin():
+            self.send_error(403, "Cross-origin request rejected")
+            return
         if self.path == "/refresh":
             force_refresh()
             self.send_response(204)

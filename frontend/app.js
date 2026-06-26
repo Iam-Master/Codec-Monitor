@@ -2,6 +2,15 @@
 
 const WS_URL = `ws://${location.hostname || "localhost"}:8766/`;
 
+// Device/output names ultimately come from Bluetooth FriendlyName strings,
+// which any nearby device can advertise — escape before inserting via
+// innerHTML so a maliciously-named device can't inject markup/script.
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
 let education = null;
 let lastSnap = null;
 let reconnectTimer = null;
@@ -124,7 +133,7 @@ function showToast(alert) {
   const timeStr = new Date(alert.time * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   el.innerHTML = `
     <div class="toast-icon ${iconType}"><i class="ti ${iconName}" aria-hidden="true"></i></div>
-    <div><div class="toast-text">${alert.msg}</div><div class="toast-time">${timeStr}</div></div>
+    <div><div class="toast-text">${escapeHtml(alert.msg)}</div><div class="toast-time">${timeStr}</div></div>
   `;
   container.appendChild(el);
   if (alert.type === "downgrade" || alert.type === "disconnect") playBeep();
@@ -337,7 +346,7 @@ function renderOutputsPage() {
   list.innerHTML = outs.map(out => {
     const icon = out.type === "bluetooth" ? "ti-bluetooth" : out.type === "microphone" ? "ti-microphone" : out.type === "hdmi" ? "ti-device-tv" : out.type === "headphones" ? "ti-headphones" : "ti-device-speaker";
     const status = out.active ? `<span class="pill ok" style="font-size:10px;padding:2px 8px">active</span>` : out.status === "OK" ? `<span class="pill neutral" style="font-size:10px;padding:2px 8px">ready</span>` : `<span class="pill neutral" style="font-size:10px;padding:2px 8px;opacity:0.5">inactive</span>`;
-    return `<div class="out-row"><span><i class="ti ${icon} out-icon${out.active ? " active" : ""}" aria-hidden="true"></i>${out.name}</span><span><span class="pill neutral" style="font-size:10px;padding:2px 8px">${friendlyType(out.type)}</span> ${status}</span></div>`;
+    return `<div class="out-row"><span><i class="ti ${icon} out-icon${out.active ? " active" : ""}" aria-hidden="true"></i>${escapeHtml(out.name)}</span><span><span class="pill neutral" style="font-size:10px;padding:2px 8px">${friendlyType(out.type)}</span> ${status}</span></div>`;
   }).join("") || `<p class="sub">No outputs detected.</p>`;
 }
 
@@ -350,20 +359,20 @@ function renderDevicesPage(silent) {
     countEl.textContent = `${list.length} known`;
     if (!list.length) { grid.innerHTML = `<p class="sub">No known devices yet — pair a device via Alternative A2DP Driver.</p>`; return; }
     grid.innerHTML = list.map(d => {
-      const photoHtml = d.photo ? `<img src="${d.photo}" alt="${d.name}">` : deviceSvg("bluetooth");
+      const photoHtml = d.photo ? `<img src="${escapeHtml(d.photo)}" alt="${escapeHtml(d.name)}">` : deviceSvg("bluetooth");
       const statusHtml = d.is_active
         ? `<span class="pill ok"><span class="live"></span>Active now (audio)</span>`
         : d.is_connected
           ? `<span class="pill accent"><span class="live"></span>Connected</span>`
           : `<span class="pill neutral">Not connected</span>`;
       const detail = d.is_active && d.codec
-        ? `<p class="sub">${d.codec.name}${d.battery != null ? " · " + d.battery + "%" : ""}</p>`
+        ? `<p class="sub">${escapeHtml(d.codec.name)}${d.battery != null ? " · " + d.battery + "%" : ""}</p>`
         : d.is_connected && d.battery != null
           ? `<p class="sub">${d.battery}% battery</p>`
           : d.battery != null
             ? `<p class="sub">Last known battery: ${d.battery}%</p>`
             : `<p class="sub">&nbsp;</p>`;
-      return `<div class="device-card"><div class="photo">${photoHtml}</div><div><p class="device-card-name">${d.name}</p>${detail}<div class="device-card-status">${statusHtml}</div></div></div>`;
+      return `<div class="device-card"><div class="photo">${photoHtml}</div><div><p class="device-card-name">${escapeHtml(d.name)}</p>${detail}<div class="device-card-status">${statusHtml}</div></div></div>`;
     }).join("");
   }).catch(() => { grid.innerHTML = `<p class="sub">Could not load devices.</p>`; });
 }
@@ -413,7 +422,7 @@ function renderAlertsPage() {
   list.innerHTML = [...alertsLog].reverse().map(a => {
     const t = new Date(a.time * 1000).toLocaleString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
     const iconType = a.type === "downgrade" ? "bad" : a.type === "disconnect" ? "warn" : a.type === "upgrade" || a.type === "connect" ? "ok" : "info";
-    return `<div class="alert-row"><span><span class="pill ${iconType}" style="font-size:10px;padding:2px 8px;margin-right:8px">${a.type}</span>${a.msg}</span><span style="color:var(--txt3);font-size:11px">${t}</span></div>`;
+    return `<div class="alert-row"><span><span class="pill ${iconType}" style="font-size:10px;padding:2px 8px;margin-right:8px">${escapeHtml(a.type)}</span>${escapeHtml(a.msg)}</span><span style="color:var(--txt3);font-size:11px">${t}</span></div>`;
   }).join("");
 }
 
@@ -549,13 +558,13 @@ function renderSnapshot(snap) {
 
   const photoEl = document.getElementById("dev-photo");
   if (photoEl) {
-    photoEl.innerHTML = device?.photo ? `<img src="${device.photo}" alt="${device.name}">` : deviceSvg(device?.type);
+    photoEl.innerHTML = device?.photo ? `<img src="${escapeHtml(device.photo)}" alt="${escapeHtml(device.name)}">` : deviceSvg(device?.type);
   }
 
   const pills = document.getElementById("dev-pills");
   pills.innerHTML = "";
   if (device) {
-    if (bt) pills.innerHTML += `<span class="pill accent"><i class="ti ti-waveform" aria-hidden="true"></i>${codec.name}</span>`;
+    if (bt) pills.innerHTML += `<span class="pill accent"><i class="ti ti-waveform" aria-hidden="true"></i>${escapeHtml(codec.name)}</span>`;
     pills.innerHTML += `<span class="pill ok"><span class="live"></span>Active</span>`;
     if (bt && codec.driver === "Alt A2DP") pills.innerHTML += `<span class="pill neutral"><i class="ti ti-plug" aria-hidden="true"></i>Alt A2DP</span>`;
   }
@@ -599,7 +608,7 @@ function renderSnapshot(snap) {
     const icon = out.type === "bluetooth" ? "ti-bluetooth" : out.type === "headphones" ? "ti-headphones" : out.type === "hdmi" ? "ti-device-tv" : "ti-device-speaker";
     const row = document.createElement("div");
     row.className = "out-row";
-    row.innerHTML = `<span><i class="ti ${icon} out-icon${out.active ? " active" : ""}" aria-hidden="true"></i>${out.name}</span>
+    row.innerHTML = `<span><i class="ti ${icon} out-icon${out.active ? " active" : ""}" aria-hidden="true"></i>${escapeHtml(out.name)}</span>
       <span class="pill ${out.active ? "ok" : "neutral"}" style="font-size:10px;padding:2px 8px">${out.active ? "active" : friendlyType(out.type)}</span>`;
     preview.appendChild(row);
   }
