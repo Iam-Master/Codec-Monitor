@@ -35,17 +35,18 @@ jobs:
           & $iscc installer.iss
 
       - name: Extract changelog section for this release
+        id: changelog
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart('v')
           $content = Get-Content CHANGELOG.md -Raw
           $pattern = "(?ms)^## \[$([regex]::Escape($version))\].*?(?=^## \[|\z)"
           $m = [regex]::Match($content, $pattern)
-          if ($m.Success) {
-            $m.Value.Trim() | Out-File -FilePath RELEASE_NOTES.md -Encoding utf8
-          } else {
-            "See CHANGELOG.md for details." | Out-File -FilePath RELEASE_NOTES.md -Encoding utf8
-          }
+          $notes = if ($m.Success) { $m.Value.Trim() } else { "See CHANGELOG.md for details." }
+          $delimiter = "EOF_$([guid]::NewGuid().ToString('N'))"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "notes<<$delimiter"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value $notes
+          Add-Content -Path $env:GITHUB_OUTPUT -Value $delimiter
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -53,6 +54,6 @@ jobs:
           files: |
             dist/Codec Monitor.exe
             dist/CodecMonitor-Setup.exe
-          body_path: RELEASE_NOTES.md
+          body: ${{ steps.changelog.outputs.notes }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
