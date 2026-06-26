@@ -58,12 +58,27 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           $headers = @{ Authorization = "token $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+          $relId = $null
           try {
             $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" -Headers $headers -Method Get -ErrorAction Stop
-            Invoke-RestMethod -Uri $rel.url -Headers $headers -Method Delete
-            Write-Host "Deleted existing release id $($rel.id) for tag $tag"
+            $relId = $rel.id
+            Write-Host "Found existing release id $relId for tag $tag"
           } catch {
-            Write-Host "No existing release found for tag $tag - nothing to delete"
+            Write-Host "GET failed (no existing release, or lookup error): $($_.Exception.Message)"
+          }
+          if ($relId) {
+            try {
+              # Invoke-WebRequest (not -RestMethod) — a 204 No Content response
+              # makes Invoke-RestMethod throw trying to parse an empty JSON body,
+              # which was silently swallowed by a too-broad catch before.
+              $resp = Invoke-WebRequest -Uri "https://api.github.com/repos/${{ github.repository }}/releases/$relId" -Headers $headers -Method Delete -ErrorAction Stop
+              Write-Host "Delete response status: $($resp.StatusCode)"
+            } catch {
+              Write-Host "DELETE FAILED for release $relId : $($_.Exception.Message)"
+              if ($_.Exception.Response) {
+                Write-Host "HTTP status: $([int]$_.Exception.Response.StatusCode)"
+              }
+            }
           }
 
       - name: Publish GitHub Release
