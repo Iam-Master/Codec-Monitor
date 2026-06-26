@@ -34,12 +34,25 @@ jobs:
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           & $iscc installer.iss
 
+      - name: Extract changelog section for this release
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $content = Get-Content CHANGELOG.md -Raw
+          $pattern = "(?ms)^## \[$([regex]::Escape($version))\].*?(?=^## \[|\z)"
+          $m = [regex]::Match($content, $pattern)
+          if ($m.Success) {
+            $m.Value.Trim() | Out-File -FilePath RELEASE_NOTES.md -Encoding utf8
+          } else {
+            "See CHANGELOG.md for details." | Out-File -FilePath RELEASE_NOTES.md -Encoding utf8
+          }
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/Codec Monitor.exe
             dist/CodecMonitor-Setup.exe
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
