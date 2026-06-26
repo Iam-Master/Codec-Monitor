@@ -63,7 +63,7 @@ PHOTOS_DIR.mkdir(exist_ok=True)
 
 PORT_HTTP = 8765
 PORT_WS = 8766
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 CODEC_INFO = json.loads(INFO_PATH.read_text(encoding="utf-8"))
 

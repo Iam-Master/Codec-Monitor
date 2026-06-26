@@ -2,6 +2,31 @@
 
 All notable changes to Codec Monitor will be documented in this file.
 
+## [1.1.1] - 2026-06-26
+
+### Security
+- Hardened CSV export against formula injection — all string fields now sanitized for leading `=`, `+`, `-`, `@`, tab, CR characters
+- Added WebSocket Origin check mirroring the HTTP CSRF check — rejects cross-origin connections from untrusted browser tabs
+- XSS hardening: codec color values are now validated before injection into style attributes
+- Device-photo fetch now enforces HTTPS-only to public hosts (SSRF hardening against loopback/private/metadata IPs)
+
+### Fixed
+- Fixed potential KeyError in `list_known_devices()` when active device dict lacks a `name` key
+- Photo fetch atomic-write now guarantees `.tmp` cleanup on failure (no orphan files)
+- Frontend history trim now uses consistent MAX_HISTORY=2200 (was triggering at 2200 but keeping only 2000)
+
+### Added
+- `docs/API.md` — full HTTP endpoint and WebSocket message-type reference
+- Troubleshooting section in README
+- 50 backend pytest cases + 20 frontend node:test cases covering all security/robustness fixes
+- `frontend/utils.js` — shared utility library (escapeHtml, safeColor, trimHistory)
+
+### Docs
+- Clarified architecture diagram timing labels (sleep intervals, not cycle durations)
+- Added icon.ico/icon.png to project structure tree
+- Added orientation header comment to app.js documenting page sections and WS protocol
+- Corrected `start_minimized` description (it works — launches window hidden to tray)
+
 ## [1.1.0] - 2026-06-26
 
 ### Security
