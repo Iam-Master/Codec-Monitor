@@ -78,8 +78,12 @@ def _signal_existing_instance() -> bool:
         return False
 
 
+_control_srv = None
+
+
 def _start_control_listener():
     def _serve():
+        global _control_srv
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -87,12 +91,16 @@ def _start_control_listener():
         except OSError:
             return
         srv.listen(5)
+        _control_srv = srv
         while True:
             try:
                 conn, _ = srv.accept()
                 conn.recv(16)
                 conn.close()
                 _show_window()
+            except OSError:
+                # srv was closed (shutdown) — exit the loop instead of spinning.
+                break
             except Exception:
                 pass
     threading.Thread(target=_serve, daemon=True).start()
@@ -105,7 +113,7 @@ def get_resource_path(relative_path):
     """Get absolute path to resource, works for dev and for PyInstaller"""
     try:
         base_path = sys._MEIPASS
-    except Exception:
+    except AttributeError:
         base_path = Path(__file__).parent.absolute()
     return os.path.join(base_path, relative_path)
 
@@ -181,6 +189,11 @@ def _terminate():
     process immediately regardless of whether the window finished destroying."""
     _stop_tooltip.set()
     monitor.shutdown()
+    if _control_srv:
+        try:
+            _control_srv.close()
+        except OSError:
+            pass
     if _icon:
         _icon.stop()
     os._exit(0)

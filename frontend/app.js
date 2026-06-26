@@ -14,6 +14,7 @@ function escapeHtml(s) {
 let education = null;
 let lastSnap = null;
 let reconnectTimer = null;
+let reconnectDelay = 1000;
 let connectEpoch = null;
 let uptimeInterval = null;
 let lastDeviceName = null;
@@ -645,11 +646,15 @@ function setConnected(on) {
 function connect() {
   setConnected(false);
   const ws = new WebSocket(WS_URL);
-  ws.onopen = () => setConnected(true);
+  ws.onopen = () => {
+    setConnected(true);
+    reconnectDelay = 1000;
+  };
   ws.onclose = () => {
     setConnected(false);
     clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connect, 2000);
+    reconnectTimer = setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
   };
   ws.onerror = () => ws.close();
   ws.onmessage = ev => {

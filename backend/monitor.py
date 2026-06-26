@@ -1765,6 +1765,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return
         if self.path == "/settings":
             length = int(self.headers.get("Content-Length", 0))
+            if length > 64 * 1024:
+                self.send_error(413, "Request body too large")
+                return
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
