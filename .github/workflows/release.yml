@@ -43,10 +43,13 @@ jobs:
           $pattern = "(?ms)^## \[$([regex]::Escape($version))\].*?(?=^## \[|\z)"
           $m = [regex]::Match($content, $pattern)
           $notes = if ($m.Success) { $m.Value.Trim() } else { "See CHANGELOG.md for details." }
+          Write-Host "Matched: $($m.Success) - notes length: $($notes.Length)"
           $delimiter = "EOF_$([guid]::NewGuid().ToString('N'))"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "notes<<$delimiter"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value $notes
-          Add-Content -Path $env:GITHUB_OUTPUT -Value $delimiter
+          $block = "notes<<$delimiter" + "`n" + $notes + "`n" + $delimiter + "`n"
+          # Add-Content's default encoding has been unreliable for the GITHUB_OUTPUT
+          # parser on this runner image; write raw UTF-8 (no BOM) via .NET directly.
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, $block, $utf8NoBom)
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
