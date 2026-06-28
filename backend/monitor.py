@@ -824,16 +824,36 @@ def slug(name: str) -> str:
 
 
 def remove_white_background(img_data: bytes) -> bytes:
-    """Load image bytes, convert background to transparent using floodfill from corners, and return as PNG bytes."""
+    """Load image bytes, convert background to transparent using mask-based floodfill, and return as PNG bytes."""
     try:
         img = Image.open(io.BytesIO(img_data)).convert("RGBA")
         width, height = img.size
-        # Perform floodfill from the 4 corners
+        
+        # Split channels to extract R, G, B, A
+        r, g, b, a = img.split()
+        
+        # Create a binary mask of near-white pixels (where R, G, B channels are all > 220)
+        r_mask = r.point(lambda p: 255 if p > 220 else 0)
+        g_mask = g.point(lambda p: 255 if p > 220 else 0)
+        b_mask = b.point(lambda p: 255 if p > 220 else 0)
+        white_mask = ImageChops.darker(ImageChops.darker(r_mask, g_mask), b_mask)
+        
+        # Explicitly force corner pixels to be white (255) in the mask so floodfill can start
         for x, y in [(0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)]:
-            color = img.getpixel((x, y))
-            # Only floodfill if the corner pixel is not already transparent
-            if color[3] > 0:
-                ImageDraw.floodfill(img, (x, y), (0, 0, 0, 0), thresh=30)
+            white_mask.putpixel((x, y), 255)
+            
+        # Floodfill the connected background region with a unique value (128) starting from corners
+        for x, y in [(0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)]:
+            if white_mask.getpixel((x, y)) == 255:
+                ImageDraw.floodfill(white_mask, (x, y), 128)
+                
+        # Create an alpha mask: 0 (transparent) where background was filled (128), 255 (opaque) elsewhere
+        alpha_mask = white_mask.point(lambda p: 0 if p == 128 else 255)
+        
+        # Combine with original alpha and apply
+        new_a = ImageChops.darker(a, alpha_mask)
+        img.putalpha(new_a)
+        
         # Save as PNG
         out = io.BytesIO()
         img.save(out, format="PNG")
