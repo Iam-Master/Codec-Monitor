@@ -77,3 +77,70 @@ def test_search_prioritizes_official_site(monkeypatch):
     urls = monitor._search_device_image_urls("OPPO Enco Buds")
     assert len(urls) == 1
     assert urls[0] in ["https://image.oppo.com/enco.png", "https://some-retailer.com/enco.png"]
+
+
+def test_get_user_country(monkeypatch):
+    import json
+    
+    # Invalidate cache first
+    monkeypatch.setattr(monitor, "_user_country_cache", None)
+    
+    class MockResponse:
+        def __init__(self, data):
+            self.data = data
+        def read(self, *a, **k):
+            return self.data
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+            
+    def _mock_urlopen(req, *a, **k):
+        url = req.full_url if hasattr(req, "full_url") else req
+        if "ipapi.co" in url:
+            return MockResponse(json.dumps({"country_code": "IN"}).encode())
+        raise AssertionError(f"Unexpected url: {url}")
+        
+    monkeypatch.setattr(monitor.urllib.request, "urlopen", _mock_urlopen)
+    
+    country = monitor._get_user_country()
+    assert country == "IN"
+
+
+def test_download_and_cache_image_aspect_ratio(monkeypatch):
+    # Invalidate downloader cache
+    monkeypatch.setattr(monitor, "_downloaded_images_cache", {})
+    
+    class MockResponse:
+        def __init__(self, data):
+            self.data = data
+        def read(self, *a, **k):
+            return self.data
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        @property
+        def headers(self):
+            return {"Content-Type": "image/png"}
+            
+    # Mock download of a wide image (ratio = 2.0)
+    img_wide = Image.new("RGB", (200, 100), color="white")
+    buf_wide = io.BytesIO()
+    img_wide.save(buf_wide, format="PNG")
+    
+    monkeypatch.setattr(monitor.urllib.request, "urlopen", lambda *a, **k: MockResponse(buf_wide.getvalue()))
+    
+    res = monitor._download_and_cache_image("https://example.com/wide.png")
+    assert res is None  # Should be rejected because aspect ratio is outside [0.75, 1.33]
+
+    # Mock download of a square image (ratio = 1.0)
+    img_sq = Image.new("RGB", (200, 200), color="white")
+    buf_sq = io.BytesIO()
+    img_sq.save(buf_sq, format="PNG")
+    
+    monkeypatch.setattr(monitor.urllib.request, "urlopen", lambda *a, **k: MockResponse(buf_sq.getvalue()))
+    
+    res = monitor._download_and_cache_image("https://example.com/square.png")
+    assert res is not None  # Should be allowed
+

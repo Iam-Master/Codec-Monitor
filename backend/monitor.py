@@ -72,7 +72,7 @@ PORT_WS = 8766
 # so already-cached photos produced by an older, less robust pass get
 # reprocessed once (see _photo_needs_reprocessing / _reprocess_outdated_photos)
 # instead of being stuck with whatever cutout quality they happened to get.
-BG_REMOVE_ALGO_VERSION = 6
+BG_REMOVE_ALGO_VERSION = 7
 APP_VERSION = "1.1.2"
 
 CODEC_INFO = json.loads(INFO_PATH.read_text(encoding="utf-8"))
@@ -634,6 +634,37 @@ def _is_safe_image_url(url: str) -> bool:
 
 _downloaded_images_cache = {}
 _downloaded_images_cache_lock = threading.Lock()
+_user_country_cache = None
+_user_country_cache_lock = threading.Lock()
+
+
+def _get_user_country() -> str | None:
+    global _user_country_cache
+    with _user_country_cache_lock:
+        if _user_country_cache is not None:
+            return _user_country_cache
+
+    country = None
+    try:
+        req = urllib.request.Request("https://ipapi.co/json/", headers={"User-Agent": "CodecMonitor/1.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            country = data.get("country_code")
+    except Exception:
+        pass
+
+    if not country:
+        try:
+            req = urllib.request.Request("http://ip-api.com/json/", headers={"User-Agent": "CodecMonitor/1.0"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                country = data.get("countryCode")
+        except Exception:
+            pass
+
+    if country:
+        _user_country_cache = country
+    return country
 
 
 def _get_official_domain(device_name: str) -> str | None:
@@ -739,7 +770,17 @@ def _download_and_cache_image(url: str, timeout: float = 3.0) -> bytes | None:
             if len(data) > 8 * 1024 * 1024:
                 return None
         if len(data) > 500:
-            Image.open(io.BytesIO(data)).verify()
+            try:
+                img = Image.open(io.BytesIO(data))
+                img.verify()
+                # Re-open to read size since verify() invalidates the stream
+                img = Image.open(io.BytesIO(data))
+                w, h = img.size
+                ratio = w / h
+                if ratio < 0.75 or ratio > 1.33:
+                    return None
+            except Exception:
+                return None
             with _downloaded_images_cache_lock:
                 _downloaded_images_cache[url] = data
             return data
@@ -770,7 +811,17 @@ def _search_device_image_urls(device_name: str) -> list[str]:
             color_suffix = f" {v}"
             break
 
-    query = f"{device_name}{color_suffix} bluetooth product photo"
+    country = _get_user_country()
+    country_map = {
+        "IN": "India",
+        "US": "US",
+        "GB": "UK",
+        "DE": "Germany",
+        "FR": "France"
+    }
+    country_suffix = f" {country_map[country]}" if country in country_map else ""
+
+    query = f"{device_name}{color_suffix}{country_suffix} bluetooth product photo"
     official_domain = _get_official_domain(device_name)
 
     reputable_domains = [
