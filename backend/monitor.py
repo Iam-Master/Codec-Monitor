@@ -33,6 +33,7 @@ import contextlib
 import html
 import io
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageStat
+from concurrent.futures import ThreadPoolExecutor
 from PIL.PngImagePlugin import PngInfo
 
 import websockets
@@ -71,7 +72,7 @@ PORT_WS = 8766
 # so already-cached photos produced by an older, less robust pass get
 # reprocessed once (see _photo_needs_reprocessing / _reprocess_outdated_photos)
 # instead of being stuck with whatever cutout quality they happened to get.
-BG_REMOVE_ALGO_VERSION = 5
+BG_REMOVE_ALGO_VERSION = 6
 APP_VERSION = "1.1.2"
 
 CODEC_INFO = json.loads(INFO_PATH.read_text(encoding="utf-8"))
@@ -631,28 +632,81 @@ def _is_safe_image_url(url: str) -> bool:
     return ip.is_global
 
 
+_downloaded_images_cache = {}
+_downloaded_images_cache_lock = threading.Lock()
+
+
+def _get_official_domain(device_name: str) -> str | None:
+    name_lower = device_name.lower()
+    if "nothing" in name_lower or "cmf" in name_lower:
+        return "nothing.tech"
+    if "realme" in name_lower:
+        return "realme.com"
+    if "oppo" in name_lower:
+        return "oppo.com"
+    if "samsung" in name_lower:
+        return "samsung.com"
+    if "sony" in name_lower:
+        return "sony.com"
+    if "oneplus" in name_lower:
+        return "oneplus.com"
+    if "jbl" in name_lower:
+        return "jbl.com"
+    if "boat" in name_lower:
+        return "boat-lifestyle.com"
+    if "xiaomi" in name_lower or "mi " in name_lower or name_lower.startswith("mi"):
+        return "mi.com"
+    return None
+
+
+def _get_image_hash(img_bytes: bytes) -> str | None:
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        img_gray = img.convert("L").resize((8, 8), Image.Resampling.LANCZOS)
+        pixels = [img_gray.getpixel((x, y)) for y in range(8) for x in range(8)]
+        avg = sum(pixels) / 64
+        return "".join("1" if p > avg else "0" for p in pixels)
+    except Exception:
+        return None
+
+
+def _hamming_distance(h1: str, h2: str) -> int:
+    return sum(c1 != c2 for c1, c2 in zip(h1, h2))
+
+
+def _download_and_cache_image(url: str, timeout: float = 3.0) -> bytes | None:
+    with _downloaded_images_cache_lock:
+        if url in _downloaded_images_cache:
+            return _downloaded_images_cache[url]
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "CodecMonitor/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if not content_type.startswith("image/"):
+                return None
+            data = resp.read(8 * 1024 * 1024 + 1)
+            if len(data) > 8 * 1024 * 1024:
+                return None
+        if len(data) > 500:
+            Image.open(io.BytesIO(data)).verify()
+            with _downloaded_images_cache_lock:
+                _downloaded_images_cache[url] = data
+            return data
+    except Exception:
+        pass
+    return None
+
+
 def _search_device_image_urls(device_name: str) -> list[str]:
     """Search DuckDuckGo for product images of the given device.
 
-    Verifies that each image comes from an official brand source or a
-    reputable tech/retail site AND that the result's own title actually
-    names the device, to ensure correctness. Returns verified image URLs
-    ranked best-match-first (not just the single best one) — CDN links
-    found via search occasionally 404 by the time we actually fetch them,
-    so the caller needs a fallback list to try instead of giving up
-    entirely after one dead link.
+    Queries official brand websites first. If those don't have images,
+    downloads images from 8-10 reputable domains in parallel, computes
+    perceptual hashes, and takes their intersection (most common visual match).
     """
     query = f"{device_name} bluetooth product photo"
+    official_domain = _get_official_domain(device_name)
 
-    # Fixed allowlist of known review/retail/manufacturer sites only —
-    # deliberately does NOT include anything derived from device_name (which
-    # ultimately comes from a Bluetooth FriendlyName that any nearby device
-    # can advertise), since that would let an attacker-controlled device name
-    # add itself to the trusted set and steer which "verified" source URLs
-    # get accepted. Includes manufacturer domains and the major Indian/global
-    # retailers that actually carry these devices — a narrower, western-only
-    # list (the original) meant common devices had no reputable hit at all
-    # and silently never got a photo.
     reputable_domains = [
         "rtings.com", "soundguys.com", "head-fi.org", "whathifi.com",
         "techradar.com", "theverge.com", "cnet.com", "tomsguide.com",
@@ -671,98 +725,93 @@ def _search_device_image_urls(device_name: str) -> list[str]:
             html = resp.read().decode("utf-8", errors="replace")
         m = re.search(r"vqd=(['\"])([^'\"]+)\1", html)
         if not m:
-            # Fallback: try the alternate vqd pattern
             m = re.search(r"vqd=([\d\-]+)", html)
         if not m:
-            return None
+            return []
         vqd = m.group(2) if m.lastindex == 2 else m.group(1)
 
         # Step 2: query the image search API
-        img_url = (
-            f"https://duckduckgo.com/i.js?q={urllib.parse.quote(query)}"
-            f"&vqd={vqd}&o=json&p=1&s=0"
-        )
+        img_url = f"https://duckduckgo.com/i.js?q={urllib.parse.quote(query)}&vqd={vqd}&o=json&p=1&s=0"
         req2 = urllib.request.Request(img_url, headers={
             "User-Agent": "CodecMonitor/1.0",
             "Referer": "https://duckduckgo.com/",
         })
         with urllib.request.urlopen(req2, timeout=5) as resp2:
             data = json.loads(resp2.read().decode("utf-8", errors="replace"))
-        
-        # Step 3: Verify the results. A reputable source domain alone isn't
-        # enough — DuckDuckGo's image results are often only loosely related
-        # to the query, so without also checking that the result's title
-        # actually names the device, a generic "wireless earbuds" listing
-        # from an allowlisted retailer could get cached as if it were a
-        # photo of an entirely different product.
-        name_tokens = [t for t in re.split(r"\s+", device_name.lower()) if len(t) >= 2]
-        name_token_set = set(name_tokens)
-        # Generic words that show up in almost every retailer title and
-        # shouldn't count against a candidate when scoring how closely its
-        # title matches the device — otherwise "Buy X TWS Earbuds with..."
-        # titles would all look equally (ir)relevant.
-        FILLER_WORDS = {
-            "buy", "tws", "earbuds", "earphones", "headphones", "headset",
-            "bluetooth", "wireless", "true", "with", "the", "and", "for",
-            "in", "ear", "global", "specifications", "specs", "accessories",
-            "audifonos", "auriculares", "tai", "nghe",
-        }
-        candidates = []
-        for r in data.get("results", []):
+
+        results = data.get("results", [])
+        official_candidates = []
+        other_candidates = []
+
+        for r in results:
             url = r.get("image", "")
             source_url = r.get("url", "").lower()
-            title = r.get("title", "").lower()
-
             if not (url and _is_safe_image_url(url)):
                 continue
             if not any(domain in source_url for domain in reputable_domains):
                 continue
-            # Forum/community subdomains (bbs.oppo.com, forum.xda-developers,
-            # etc.) are user-uploaded content, not manufacturer product
-            # assets — even on an otherwise-reputable domain, a post titled
-            # exactly with the device name can attach a completely unrelated
-            # image (a teardown photo, a driver diagram, a meme). They also
-            # tend to win the "fewest extra words" ranking below precisely
-            # because a terse forum post title has nothing else in it, so
-            # they must be excluded outright rather than just de-prioritized.
-            hostname = urllib.parse.urlparse(r.get("url", "")).hostname or ""
+            # Filter forum/community subdomains
+            hostname = urllib.parse.urlparse(source_url).hostname or ""
             first_label = hostname.split(".")[0].lower()
             if first_label.startswith(("bbs", "forum", "community", "discuss", "answers", "ask")):
                 continue
-            if name_tokens and not all(tok in title for tok in name_tokens):
-                continue
-            # Prefer the title that names the device most exactly — e.g. for
-            # "OPPO Enco Buds", an official page titled "OPPO Enco Buds" should
-            # win over "OPPO Enco Buds 2", which also happens to contain every
-            # token of the (shorter) device name as a substring.
-            title_words = set(re.findall(r"[a-z0-9]+", title))
-            extra_words = title_words - name_token_set - FILLER_WORDS
-            # Manufacturer product pages mix the actual product photo with
-            # technical/feature-illustration tiles (a driver cutaway diagram,
-            # a touch-gesture graphic, a connectivity-range graphic) under the
-            # same official domain and an equally legitimate device-name
-            # title — domain trust and title matching can't tell those apart
-            # from a real product photo. De-prioritize (not exclude — a real
-            # photo occasionally lives at a path like this too) candidates
-            # whose own URL suggests a spec/feature graphic rather than a
-            # product shot.
-            spec_graphic_penalty = 3 if re.search(
-                r"feature|spec|callout|highlight|tile|intellect|fingertip|ksp|driver|diaphragm|chip|sensor|/grid/",
-                url.lower(),
-            ) else 0
-            # Same idea for "lifestyle" shots that show the product inside a
-            # phone's companion-app screenshot (a connect/pairing screen, a
-            # battery widget) rather than the product itself — a legitimate
-            # official asset, but a phone-in-frame is a poor fit for a small
-            # square device-card thumbnail.
-            lifestyle_penalty = 3 if re.search(
-                r"screen|app[-_]?connect|pairing|companion|widget|notification",
-                url.lower() + " " + title,
-            ) else 0
-            candidates.append((len(extra_words) + spec_graphic_penalty + lifestyle_penalty, url))
 
-        candidates.sort(key=lambda c: c[0])
-        return [url for _, url in candidates]
+            # Classify candidates
+            if official_domain and official_domain in source_url:
+                official_candidates.append(url)
+            else:
+                other_candidates.append((url, hostname))
+
+        # Helper task for concurrent execution
+        def _fetch_task(url):
+            data = _download_and_cache_image(url, timeout=3.0)
+            if data:
+                h = _get_image_hash(data)
+                if h:
+                    return {"url": url, "hash": h}
+            return None
+
+        # 1. Try official candidates first
+        if official_candidates:
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                downloaded = list(executor.map(_fetch_task, official_candidates[:3]))
+            downloaded = [d for d in downloaded if d is not None]
+            if downloaded:
+                print(f"  Image search: selected official website photo: {downloaded[0]['url']}")
+                return [downloaded[0]["url"]]
+
+        # 2. Fall back to intersection of other sites (up to 10 unique domains)
+        seen_domains = set()
+        selected_candidates = []
+        for url, hostname in other_candidates:
+            if hostname not in seen_domains:
+                seen_domains.add(hostname)
+                selected_candidates.append(url)
+            if len(selected_candidates) >= 10:
+                break
+
+        if selected_candidates:
+            with ThreadPoolExecutor(max_workers=len(selected_candidates)) as executor:
+                downloaded = list(executor.map(_fetch_task, selected_candidates))
+            downloaded = [d for d in downloaded if d is not None]
+
+            if downloaded:
+                groups = []
+                for item in downloaded:
+                    added = False
+                    for group in groups:
+                        if _hamming_distance(item["hash"], group[0]["hash"]) <= 4:
+                            group.append(item)
+                            added = True
+                            break
+                    if not added:
+                        groups.append([item])
+                
+                groups.sort(key=len, reverse=True)
+                best_group = groups[0]
+                print(f"  Image search: selected intersection photo from {len(best_group)} domains: {best_group[0]['url']}")
+                return [best_group[0]["url"]]
+
     except Exception as e:
         print(f"  Image search failed for '{device_name}': {e}")
     return []
@@ -1210,21 +1259,22 @@ def fetch_photo_for_device(device_name: str):
         # actually fetch them, so one dead link shouldn't mean "no photo".
         for url in urls:
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "CodecMonitor/1.0"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    content_type = resp.headers.get("Content-Type", "")
-                    if not content_type.startswith("image/"):
-                        print(f"  Photo fetch rejected for {device_name}: non-image Content-Type '{content_type}'")
-                        continue
-                    # Read one byte past the cap so an oversized image is
-                    # detected and rejected outright, instead of being
-                    # silently truncated mid-stream into a corrupt file that
-                    # then sits in the cache forever (get_photo_path only
-                    # checks file size, not that the image actually decodes).
-                    data = resp.read(MAX_BYTES + 1)
-                    if len(data) > MAX_BYTES:
-                        print(f"  Photo fetch rejected for {device_name}: image exceeds {MAX_BYTES} byte cap")
-                        continue
+                data = None
+                with _downloaded_images_cache_lock:
+                    if url in _downloaded_images_cache:
+                        data = _downloaded_images_cache[url]
+
+                if data is None:
+                    req = urllib.request.Request(url, headers={"User-Agent": "CodecMonitor/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        content_type = resp.headers.get("Content-Type", "")
+                        if not content_type.startswith("image/"):
+                            print(f"  Photo fetch rejected for {device_name}: non-image Content-Type '{content_type}'")
+                            continue
+                        data = resp.read(MAX_BYTES + 1)
+                        if len(data) > MAX_BYTES:
+                            print(f"  Photo fetch rejected for {device_name}: image exceeds {MAX_BYTES} byte cap")
+                            continue
                 if len(data) <= 500:
                     continue
                 try:
