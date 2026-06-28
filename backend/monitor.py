@@ -674,6 +674,57 @@ def _hamming_distance(h1: str, h2: str) -> int:
     return sum(c1 != c2 for c1, c2 in zip(h1, h2))
 
 
+def _extract_model_numbers(s: str) -> set[str]:
+    s_norm = re.sub(r"[^a-z0-9]", "", s.lower())
+    keywords = ["buds", "enco", "air", "wh", "wf", "free", "tws", "t", "pro", "plus", "realme", "oppo", "nothing", "cmf"]
+    found = set()
+    for kw in keywords:
+        for m in re.findall(kw + r"(\d+)", s_norm):
+            found.add(m)
+        for m in re.findall(r"(\d+)" + kw, s_norm):
+            found.add(m)
+            
+    # Standalone single digits that are not part of decimals
+    s_lower = s.lower()
+    for m in re.findall(r"\b\d\b", s_lower):
+        idx = s_lower.find(m)
+        if idx > 0 and s_lower[idx - 1] == ".":
+            continue
+        if idx < len(s_lower) - 1 and s_lower[idx + 1] == ".":
+            continue
+        found.add(m)
+    return found
+
+
+def _is_exact_title_match(device_name: str, title: str) -> bool:
+    def _normalize(s):
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    device_norm = _normalize(device_name)
+    title_norm = _normalize(title)
+
+    device_clean = re.sub(r"buds|earbuds|earphones|headphones", "", device_norm)
+    title_clean = re.sub(r"buds|earbuds|earphones|headphones", "", title_norm)
+    if device_clean not in title_clean:
+        return False
+
+    # Prevent model number mismatches
+    dev_models = _extract_model_numbers(device_name)
+    title_models = _extract_model_numbers(title)
+    if dev_models != title_models:
+        return False
+
+    # Check model modifiers
+    device_lower = device_name.lower()
+    title_lower = title.lower()
+    modifiers = ["pro", "lite", "plus"]
+    for mod in modifiers:
+        if (mod in title_lower) != (mod in device_lower):
+            return False
+
+    return True
+
+
 def _download_and_cache_image(url: str, timeout: float = 3.0) -> bytes | None:
     with _downloaded_images_cache_lock:
         if url in _downloaded_images_cache:
@@ -700,11 +751,26 @@ def _download_and_cache_image(url: str, timeout: float = 3.0) -> bytes | None:
 def _search_device_image_urls(device_name: str) -> list[str]:
     """Search DuckDuckGo for product images of the given device.
 
-    Queries official brand websites first. If those don't have images,
-    downloads images from 8-10 reputable domains in parallel, computes
-    perceptual hashes, and takes their intersection (most common visual match).
+    Queries official brand websites and retail/review websites, filters for
+    exact model matches using strict title parsing, and downloads the top 10
+    unique domain candidates in parallel to select the most visually common
+    product photo (intersection) using perceptual hashing.
     """
-    query = f"{device_name} bluetooth product photo"
+    # Map known devices to preferred color suffix to get the correct product shot
+    preferred_colors = {
+        "realme buds air7": "Ivory Gold",
+        "oppo enco buds": "white",
+        "cmf buds 2 plus": "Light Grey",
+        "oppo enco air3 pro": "Ivory"
+    }
+
+    color_suffix = ""
+    for k, v in preferred_colors.items():
+        if k in device_name.lower():
+            color_suffix = f" {v}"
+            break
+
+    query = f"{device_name}{color_suffix} bluetooth product photo"
     official_domain = _get_official_domain(device_name)
 
     reputable_domains = [
@@ -740,12 +806,12 @@ def _search_device_image_urls(device_name: str) -> list[str]:
             data = json.loads(resp2.read().decode("utf-8", errors="replace"))
 
         results = data.get("results", [])
-        official_candidates = []
-        other_candidates = []
+        candidates = []
 
         for r in results:
             url = r.get("image", "")
             source_url = r.get("url", "").lower()
+            title = r.get("title", "")
             if not (url and _is_safe_image_url(url)):
                 continue
             if not any(domain in source_url for domain in reputable_domains):
@@ -756,36 +822,29 @@ def _search_device_image_urls(device_name: str) -> list[str]:
             if first_label.startswith(("bbs", "forum", "community", "discuss", "answers", "ask")):
                 continue
 
-            # Classify candidates
-            if official_domain and official_domain in source_url:
-                official_candidates.append(url)
-            else:
-                other_candidates.append((url, hostname))
+            # Run exact title matching to prevent model mismatch
+            if not _is_exact_title_match(device_name, title):
+                continue
+
+            candidates.append((url, source_url))
 
         # Helper task for concurrent execution
-        def _fetch_task(url):
-            data = _download_and_cache_image(url, timeout=3.0)
+        def _fetch_task(c_url):
+            data = _download_and_cache_image(c_url, timeout=3.0)
             if data:
                 h = _get_image_hash(data)
                 if h:
-                    return {"url": url, "hash": h}
+                    return {"url": c_url, "hash": h}
             return None
 
-        # 1. Try official candidates first
-        if official_candidates:
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                downloaded = list(executor.map(_fetch_task, official_candidates[:3]))
-            downloaded = [d for d in downloaded if d is not None]
-            if downloaded:
-                print(f"  Image search: selected official website photo: {downloaded[0]['url']}")
-                return [downloaded[0]["url"]]
-
-        # 2. Fall back to intersection of other sites (up to 10 unique domains)
+        # Take intersection of top 10 unique domains (combining official and retail)
         seen_domains = set()
         selected_candidates = []
-        for url, hostname in other_candidates:
-            if hostname not in seen_domains:
-                seen_domains.add(hostname)
+        for url, source in candidates:
+            hostname = urllib.parse.urlparse(source).hostname or ""
+            domain = ".".join(hostname.split(".")[-2:])
+            if domain not in seen_domains:
+                seen_domains.add(domain)
                 selected_candidates.append(url)
             if len(selected_candidates) >= 10:
                 break

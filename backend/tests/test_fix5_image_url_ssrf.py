@@ -60,8 +60,8 @@ def test_fetch_refuses_unsafe_url_without_downloading(monkeypatch):
     # Proceed past the cache short-circuits, return an unsafe (http/loopback) URL
     # from search, and assert urlopen is NEVER called.
     monkeypatch.setattr(monitor, "get_photo_path", lambda name: None)
-    monkeypatch.setattr(monitor, "_search_device_image_url",
-                        lambda name: "http://127.0.0.1/evil.jpg")
+    monkeypatch.setattr(monitor, "_search_device_image_urls",
+                        lambda name: ["http://127.0.0.1/evil.jpg"])
 
     called = {"urlopen": False}
 

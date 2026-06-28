@@ -412,6 +412,7 @@ function renderDevicesPage(silent) {
     if (!list.length) { grid.innerHTML = `<p class="sub">No known devices yet — pair a device via Alternative A2DP Driver.</p>`; return; }
     grid.innerHTML = list.map(d => {
       const photoHtml = d.photo ? `<img src="${escapeHtml(d.photo)}" alt="${escapeHtml(d.name)}">` : deviceSvg("bluetooth");
+      const photoClass = d.photo ? "photo has-img" : "photo";
       const statusHtml = d.is_active
         ? `<span class="pill ok"><span class="live"></span>Active now (audio)</span>`
         : d.is_connected
@@ -424,7 +425,7 @@ function renderDevicesPage(silent) {
           : d.battery != null
             ? `<p class="sub">Last known battery: ${d.battery}%</p>`
             : `<p class="sub">&nbsp;</p>`;
-      return `<div class="device-card"><div class="photo">${photoHtml}</div><div><p class="device-card-name">${escapeHtml(d.name)}</p>${detail}<div class="device-card-status">${statusHtml}</div></div></div>`;
+      return `<div class="device-card"><div class="${photoClass}">${photoHtml}</div><div><p class="device-card-name">${escapeHtml(d.name)}</p>${detail}<div class="device-card-status">${statusHtml}</div></div></div>`;
     }).join("");
   }).catch(() => { grid.innerHTML = `<p class="sub">Could not load devices.</p>`; });
 }
@@ -626,6 +627,7 @@ function renderSnapshot(snap) {
   const photoEl = document.getElementById("dev-photo");
   if (photoEl) {
     photoEl.innerHTML = device?.photo ? `<img src="${escapeHtml(device.photo)}" alt="${escapeHtml(device.name)}">` : deviceSvg(device?.type);
+    photoEl.classList.toggle("has-img", !!device?.photo);
   }
 
   const pills = document.getElementById("dev-pills");
