@@ -91,13 +91,32 @@ _known_devices_cache = None
 _known_devices_cache_time = 0.0
 _known_devices_cache_lock = threading.Lock()
 
-_photo_fetch_lock = threading.Lock()
+# Per-device locks for photo fetching — allows parallel fetches for different
+# devices instead of serializing everything through one global lock.
+_photo_fetch_locks: dict[str, threading.Lock] = {}
+_photo_fetch_locks_lock = threading.Lock()
+
+def _get_photo_fetch_lock(device_name: str) -> threading.Lock:
+    """Get or create a per-device lock for photo fetching."""
+    with _photo_fetch_locks_lock:
+        if device_name not in _photo_fetch_locks:
+            _photo_fetch_locks[device_name] = threading.Lock()
+        return _photo_fetch_locks[device_name]
 
 _last_history_state = None
 _last_history_time = 0.0
 
 _active_photo_fetches = set()
 _active_photo_fetches_lock = threading.Lock()
+
+# In-memory cache for get_photo_path to avoid filesystem I/O every 800ms.
+# Maps cleaned+slugified device name -> "/photos/<slug>.<ext>" or None.
+_photo_path_cache = {}
+_photo_path_cache_lock = threading.Lock()
+
+# Set by _fetch_photo_wrapper after a photo is fetched, so the next fast_loop
+# iteration bypasses snapshot dedup and pushes the updated photo to clients.
+_force_snapshot_push = threading.Event()
 
 _ws_queues = set()
 _ws_queues_lock = threading.Lock()
@@ -1289,6 +1308,8 @@ def _invalidate_outdated_photos():
                 if 0 < version < BG_REMOVE_ALGO_VERSION:
                     try:
                         fpath.unlink()
+                        with _photo_path_cache_lock:
+                            _photo_path_cache.pop(fpath.stem, None)
                         print(f"  Invalidated outdated cached photo: {fpath.name}")
                     except OSError as ex:
                         print(f"  Failed to invalidate photo {fpath.name}: {ex}")
@@ -1316,6 +1337,8 @@ def migrate_existing_photos():
                     dest_png = fpath.with_suffix(".png")
                     _write_photo_atomic(dest_png, processed_data)
                     fpath.unlink()
+                    with _photo_path_cache_lock:
+                        _photo_path_cache.pop(fpath.stem, None)
                     print(f"  Migrated photo background to transparent PNG: {fpath.name} -> {dest_png.name}")
                 except Exception as ex:
                     print(f"  Failed to migrate photo {fpath.name}: {ex}")
@@ -1328,10 +1351,18 @@ def get_photo_path(device_name: str) -> str | None:
         return None
     cleaned = _clean_device_name(device_name)
     s = slug(cleaned)
+    with _photo_path_cache_lock:
+        if s in _photo_path_cache:
+            return _photo_path_cache[s]
     for ext in ("png", "jpg", "webp", "jpeg"):
         p = PHOTOS_DIR / f"{s}.{ext}"
         if p.exists() and p.stat().st_size > 500:
-            return f"/photos/{s}.{ext}"
+            result = f"/photos/{s}.{ext}"
+            with _photo_path_cache_lock:
+                _photo_path_cache[s] = result
+            return result
+    with _photo_path_cache_lock:
+        _photo_path_cache[s] = None
     return None
 
 
@@ -1362,7 +1393,8 @@ def fetch_photo_for_device(device_name: str):
     cleaned = _clean_device_name(device_name)
     if not cleaned or get_photo_path(cleaned):
         return
-    with _photo_fetch_lock:
+    device_lock = _get_photo_fetch_lock(cleaned)
+    with device_lock:
         if get_photo_path(cleaned):
             return
         urls = [u for u in _search_device_image_urls(cleaned) if _is_safe_image_url(u)]
@@ -1417,6 +1449,8 @@ def fetch_photo_for_device(device_name: str):
                 processed_data, removed = remove_white_background(data)
                 if removed:
                     _write_photo_atomic(dest, processed_data)
+                    with _photo_path_cache_lock:
+                        _photo_path_cache.pop(slug(cleaned), None)
                     print(f"  Photo cached and background removed: {dest.name} ({len(processed_data)} bytes)")
                     return
                 # Background removal was skipped (non-uniform border — e.g. a
@@ -1431,12 +1465,17 @@ def fetch_photo_for_device(device_name: str):
         if fallback is not None:
             fb_dest, fb_data = fallback
             _write_photo_atomic(fb_dest, fb_data)
+            with _photo_path_cache_lock:
+                _photo_path_cache.pop(slug(cleaned), None)
             print(f"  Photo cached without background removal (no clean candidate found): {fb_dest.name}")
 
 
 def _fetch_photo_wrapper(device_name: str):
     try:
         fetch_photo_for_device(device_name)
+        # Force the next fast_loop snapshot to be sent even if it looks
+        # identical — the photo field just changed from None to a path.
+        _force_snapshot_push.set()
     finally:
         with _active_photo_fetches_lock:
             _active_photo_fetches.discard(device_name)
@@ -1448,6 +1487,15 @@ def prefetch_photos():
     that just haven't happened to be the active one yet."""
     _invalidate_outdated_photos()
     names = get_all_known_device_names()
+
+    # Prioritize the currently active device so the dashboard shows its
+    # photo as quickly as possible instead of waiting for other devices.
+    if _alt_a2dp_installed:
+        fast_hit = find_active_alt_a2dp_device()
+        if fast_hit:
+            active_name = _clean_device_name(fast_hit["name"])
+            names.sort(key=lambda n: (n.lower() != active_name.lower(), n))
+
     for name in names:
         if not get_photo_path(name):
             print(f"  Pre-fetching photo for {name}...")
@@ -1878,10 +1926,11 @@ while ($true) {
         }
 
         [Console]::WriteLine((@{ bluetooth = $rows } | ConvertTo-Json -Depth 5 -Compress))
+        [Console]::Out.Flush()
     } catch {
         [Console]::WriteLine('{"bluetooth":[]}')
+        [Console]::Out.Flush()
     }
-    Start-Sleep -Milliseconds __POLL_MS__
 }
 """.replace("__BT_EXCLUSION_REGEX__", BT_EXCLUSION_REGEX)
 
@@ -1891,10 +1940,11 @@ while ($true) {
         $endpoints = @(Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue |
             Select-Object FriendlyName, Status)
         [Console]::WriteLine((@{ endpoints = $endpoints } | ConvertTo-Json -Depth 5 -Compress))
+        [Console]::Out.Flush()
     } catch {
         [Console]::WriteLine('{"endpoints":[]}')
+        [Console]::Out.Flush()
     }
-    Start-Sleep -Milliseconds __POLL_MS__
 }
 """
 
@@ -1904,9 +1954,8 @@ ENDPOINTS_LOOP_SLEEP_MS = 1500  # endpoints alone are cheap (~1-1.5s/call) — k
 
 
 def start_ps_poller():
-    script = BT_BATTERY_LOOP_SCRIPT.replace("__POLL_MS__", str(SLOW_LOOP_SLEEP_MS))
     proc = subprocess.Popen(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", BT_BATTERY_LOOP_SCRIPT],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, bufsize=1,
         creationflags=CREATE_NO_WINDOW,
@@ -1916,9 +1965,8 @@ def start_ps_poller():
 
 
 def start_endpoints_poller():
-    script = ENDPOINTS_LOOP_SCRIPT.replace("__POLL_MS__", str(ENDPOINTS_LOOP_SLEEP_MS))
     proc = subprocess.Popen(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ENDPOINTS_LOOP_SCRIPT],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, bufsize=1,
         creationflags=CREATE_NO_WINDOW,
@@ -2037,6 +2085,13 @@ def build_snapshot_from_raw(raw: dict) -> dict:
         raw_endpoints = [raw_endpoints] if raw_endpoints else []
 
     bt_names = [d.get("Name", "") for d in bt_devices if d.get("Name")]
+    # When the slow_loop hasn't populated _cached_raw yet (first few seconds
+    # after startup), bt_names is empty and endpoints can't be matched to BT
+    # devices — so the active BT device gets classified as "headphones" and
+    # the codec defaults to PCM with no bitrate.  Use the history/registry
+    # fallback so classification works from the first fast_loop tick.
+    if not bt_names:
+        bt_names = get_all_known_device_names()
 
     endpoints = []
     for ep in raw_endpoints:
@@ -2127,11 +2182,11 @@ def build_snapshot_from_raw(raw: dict) -> dict:
 
     if matched_bt:
         bt_name = matched_bt["Name"]
+        photo_url = get_photo_path(bt_name)
         with _active_photo_fetches_lock:
-            if not get_photo_path(bt_name) and bt_name not in _active_photo_fetches:
+            if not photo_url and bt_name not in _active_photo_fetches:
                 _active_photo_fetches.add(bt_name)
                 threading.Thread(target=_fetch_photo_wrapper, args=(bt_name,), daemon=True).start()
-        photo_url = get_photo_path(bt_name)
         device = {
             "name": bt_name,
             "type": "bluetooth",
@@ -2142,14 +2197,22 @@ def build_snapshot_from_raw(raw: dict) -> dict:
             "photo": photo_url,
         }
     elif active_ep:
+        ep_name = _clean_device_name(active_ep["name"]) if active_ep["type"] == "bluetooth" else active_ep["name"]
+        photo_url = get_photo_path(ep_name)
+        # Use last known battery from history DB as a fallback so the
+        # dashboard shows a value immediately instead of waiting for
+        # the slow PowerShell loop (~15s on startup).
+        battery = None
+        if active_ep["type"] == "bluetooth":
+            battery = get_last_known_battery(ep_name)
         device = {
-            "name": active_ep["name"],
+            "name": ep_name,
             "type": active_ep["type"],
             "mac": None,
-            "battery": None,
+            "battery": battery,
             "connected": True,
             "connect_epoch": _device_connect_time,
-            "photo": None,
+            "photo": photo_url,
         }
     else:
         device = None
@@ -2240,6 +2303,9 @@ def slow_loop():
     responsive; endpoints_loop() handles non-BT outputs on its own fast cadence.
     """
     global _ps_proc
+    _slow_loop_t0 = time.time()
+    _slow_loop_cycle = 0
+    first_cycle = True
     while not _shutting_down.is_set():
         proc = start_ps_poller()
         with _ps_proc_lock:
@@ -2259,6 +2325,8 @@ def slow_loop():
             bt_list = raw.get("bluetooth", [])
             if not isinstance(bt_list, list):
                 bt_list = [bt_list] if bt_list else []
+            _slow_loop_cycle += 1
+            battery_count = 0
             for d in bt_list:
                 instance_id = d.get("InstanceId", "")
                 name = d.get("Name")
@@ -2271,9 +2339,20 @@ def slow_loop():
                             set_cached_instance_id(_clean_device_name(name), iid)
                 batt = d.get("Battery")
                 if batt is not None:
+                    battery_count += 1
                     mac_raw = extract_mac_raw(instance_id)
                     if mac_raw:
                         set_cached_battery(mac_raw, batt)
+            print(f"  [{time.time() - _slow_loop_t0:.3f}s] slow_loop cycle #{_slow_loop_cycle}: "
+                  f"{len(bt_list)} devices, {battery_count} with battery, first_cycle={first_cycle}")
+            # Signal fast_loop to push an updated snapshot with the new
+            # battery/device data instead of waiting for the next 800ms poll.
+            _force_snapshot_push.set()
+            # Skip sleep on the first cycle so battery data reaches the
+            # dashboard as fast as possible on app startup.
+            if not first_cycle:
+                time.sleep(SLOW_LOOP_SLEEP_MS / 1000)
+            first_cycle = False
         # proc's stdout closed (terminated via force_refresh, or it crashed) — respawn.
 
 
@@ -2283,6 +2362,7 @@ def endpoints_loop():
     battery lookups, so there's no reason to gate built-in/wired output
     detection behind that loop's much higher per-cycle cost."""
     global _endpoints_proc
+    first_cycle = True
     while not _shutting_down.is_set():
         proc = start_endpoints_poller()
         with _endpoints_proc_lock:
@@ -2299,6 +2379,13 @@ def endpoints_loop():
                 continue
             with _cached_endpoints_lock:
                 _cached_endpoints[:] = raw.get("endpoints", [])
+            # Signal fast_loop to push an updated snapshot with the new
+            # endpoints data instead of waiting for the next 800ms poll.
+            _force_snapshot_push.set()
+            # Skip sleep on the first cycle so outputs list appears ASAP.
+            if not first_cycle:
+                time.sleep(ENDPOINTS_LOOP_SLEEP_MS / 1000)
+            first_cycle = False
         # proc's stdout closed — respawn.
 
 
@@ -2312,13 +2399,24 @@ def fast_loop():
     global _cached_snapshot, _last_history_state, _last_history_time
     comtypes.CoInitialize()  # this thread calls pycaw (Core Audio API) every tick
     _last_payload_json = ""
+    _fast_loop_count = 0
+    _fast_loop_t0 = time.time()
     while not _shutting_down.is_set():
+        _fast_loop_count += 1
         with _cached_raw_lock:
             bt = list(_cached_raw["bluetooth"])
         with _cached_endpoints_lock:
             endpoints = list(_cached_endpoints)
         raw = {"bluetooth": bt, "endpoints": endpoints}
         snap = build_snapshot_from_raw(raw)
+        if _fast_loop_count <= 3:
+            dev = snap.get("device")
+            print(f"  [{time.time() - _fast_loop_t0:.3f}s] fast_loop #{_fast_loop_count}: "
+                  f"device={dev.get('name') if dev else None}, "
+                  f"battery={dev.get('battery') if dev else None}, "
+                  f"codec={snap['codec'].get('name')}, "
+                  f"bitrate={snap['codec'].get('bitrate_kbps')}, "
+                  f"outputs={len(snap.get('outputs', []))}")
         new_alerts = check_alerts(snap)
         
         # O1: Deduplicate DB Insertion
@@ -2337,6 +2435,11 @@ def fast_loop():
             _last_history_time = now
             
         # O2: WebSocket Snapshot Deduplication
+        # After a photo fetch completes, bypass dedup so the updated
+        # photo path reaches clients immediately.
+        if _force_snapshot_push.is_set():
+            _force_snapshot_push.clear()
+            _last_payload_json = ""
         payload = {
             "device": snap["device"],
             "codec": snap["codec"],
@@ -2579,7 +2682,14 @@ async def ws_handler(websocket):
             cached = _cached_snapshot
         if cached:
             snap, _ = cached
+            dev = snap.get("device")
+            print(f"  [ws] Sending initial snapshot to client: "
+                  f"device={dev.get('name') if dev else None}, "
+                  f"battery={dev.get('battery') if dev else None}, "
+                  f"bitrate={snap['codec'].get('bitrate_kbps')}")
             await websocket.send(json.dumps({"type": "snapshot", "data": snap}))
+        else:
+            print(f"  [ws] No cached snapshot yet — client will wait for first fast_loop push")
 
         while True:
             msg = await q.get()
@@ -2602,19 +2712,29 @@ def start_backend():
     Does not start the WebSocket server — callers run that themselves
     (asyncio.run(run_ws_server()) blocks, so app.py runs it on its own thread).
     """
+    _startup_t0 = time.time()
     print("Codec Monitor backend v5 starting...")
     load_settings()
+    print(f"  [{time.time() - _startup_t0:.3f}s] load_settings done")
     init_history_db()
+    print(f"  [{time.time() - _startup_t0:.3f}s] init_history_db done")
     load_recent_history_into_memory()
+    print(f"  [{time.time() - _startup_t0:.3f}s] load_recent_history_into_memory done")
     migrate_existing_photos()
+    print(f"  [{time.time() - _startup_t0:.3f}s] migrate_existing_photos done")
     # HTTP server starts first and on its own thread so the window has something
     # to load immediately — photo prefetch is a nice-to-have, not a blocker.
     threading.Thread(target=run_http_server, daemon=True).start()
+    print(f"  [{time.time() - _startup_t0:.3f}s] HTTP server thread started")
     threading.Thread(target=fast_loop, daemon=True).start()
+    print(f"  [{time.time() - _startup_t0:.3f}s] fast_loop thread started")
     threading.Thread(target=slow_loop, daemon=True).start()
+    print(f"  [{time.time() - _startup_t0:.3f}s] slow_loop thread started")
     threading.Thread(target=endpoints_loop, daemon=True).start()
+    print(f"  [{time.time() - _startup_t0:.3f}s] endpoints_loop thread started")
     threading.Thread(target=_history_maintenance_loop, daemon=True).start()
     threading.Thread(target=prefetch_photos, daemon=True).start()
+    print(f"  [{time.time() - _startup_t0:.3f}s] All threads started")
     print(f"  Dashboard: http://localhost:{PORT_HTTP}/")
     print(f"  Live data: ws://localhost:{PORT_WS}/")
 

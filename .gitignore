@@ -29,3 +29,6 @@ Desktop.ini
 .DS_Store
 *.stackdump
 *.log
+
+# Command Code
+.commandcode/

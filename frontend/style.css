@@ -307,7 +307,7 @@ html, body {
      a fixed light card here (instead of the theme's --bg2, which goes dark)
      means those leftovers blend into the card the same way in both themes,
      instead of turning into a hard dark gap when the theme is dark. */
-  background: transparent;
+  background: #f5f5f0;
   border: none;
 }
 .photo img {
