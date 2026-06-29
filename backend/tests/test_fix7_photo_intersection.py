@@ -154,3 +154,44 @@ def test_download_and_cache_image_aspect_ratio(monkeypatch):
     res = monitor._download_and_cache_image("https://example.com/small.png")
     assert res is None  # Should be rejected because it is too small (50 < 120)
 
+
+def test_get_photo_path_cleaning(tmp_path, monkeypatch):
+    monkeypatch.setattr(monitor, "PHOTOS_DIR", tmp_path)
+    
+    # Create a cached photo for a cleaned name
+    f = tmp_path / "cmf_buds_2_plus.png"
+    f.write_bytes(b"dummy image bytes over 500 bytes" * 20)
+    
+    # Query with Hands-Free suffix
+    p1 = monitor.get_photo_path("CMF Buds 2 Plus Hands-Free")
+    assert p1 == "/photos/cmf_buds_2_plus.png"
+    
+    # Query with handsfree lowercase suffix
+    p2 = monitor.get_photo_path("CMF Buds 2 Plus handsfree")
+    assert p2 == "/photos/cmf_buds_2_plus.png"
+
+
+def test_remove_white_background_feathered():
+    # Create an image with a white background and a light green product center
+    # Center color difference from white: R=192, G=213, B=176 (diff = 79)
+    from PIL import ImageDraw
+    img = Image.new("RGB", (200, 200), color="white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([20, 20, 180, 180], fill="#C0D5B0")
+    
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    
+    processed_data, success = monitor.remove_white_background(buf.getvalue())
+    assert success is True
+    
+    processed_img = Image.open(io.BytesIO(processed_data))
+    # Bounding box should be cropped to the product center
+    assert processed_img.size[0] < 200
+    
+    # Center of the product must be fully opaque
+    center_px = (processed_img.size[0] // 2, processed_img.size[1] // 2)
+    alpha = processed_img.getpixel(center_px)[3]
+    assert alpha == 255  # Should remain fully opaque
+
+

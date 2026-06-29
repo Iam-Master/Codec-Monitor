@@ -72,7 +72,7 @@ PORT_WS = 8766
 # so already-cached photos produced by an older, less robust pass get
 # reprocessed once (see _photo_needs_reprocessing / _reprocess_outdated_photos)
 # instead of being stuck with whatever cutout quality they happened to get.
-BG_REMOVE_ALGO_VERSION = 8
+BG_REMOVE_ALGO_VERSION = 9
 APP_VERSION = "1.1.2"
 
 CODEC_INFO = json.loads(INFO_PATH.read_text(encoding="utf-8"))
@@ -1196,28 +1196,14 @@ def remove_white_background(img_data: bytes) -> tuple[bytes, bool]:
         dr, dg, db = ImageChops.difference(smoothed, bg_plane).split()
         dist = ImageChops.lighter(ImageChops.lighter(dr, dg), db)
 
-        # Soft ramp: definitely background below LOW (alpha 0), definitely
-        # product above HIGH (alpha 255), linear blend between — this is
-        # what gives a smooth, anti-aliased edge instead of a jagged one.
-        LOW, HIGH = 24, 56
-
-        def _ramp(p):
-            if p <= LOW:
-                return 0
-            if p >= HIGH:
-                return 255
-            return int((p - LOW) * 255 / (HIGH - LOW))
-
-        soft_alpha = dist.point(_ramp)
+        threshold = 28
+        # Binary background mask: 255 for candidate background, 0 for product
+        bg_mask = dist.point(lambda p: 255 if p <= threshold else 0)
 
         # Connected-component correction: only pixels in the "definitely
         # background" band that are reachable from the image border via
-        # other near-background pixels count as real background. Nothing is
-        # dilated, so this can't leak through a seam — it can only follow
-        # pixels that were already classified as background-colored.
-        STRICT_BG = 40
-        bg_candidate = dist.point(lambda p: 255 if p <= STRICT_BG else 0)
-        reach = bg_candidate.copy()
+        # other near-background pixels count as real background.
+        reach = bg_mask.copy()
         FILL_MARK = 180
         for x in range(width):
             for y in (0, height - 1):
@@ -1229,17 +1215,13 @@ def remove_white_background(img_data: bytes) -> tuple[bytes, bool]:
                     ImageDraw.floodfill(reach, (x, y), FILL_MARK)
         border_connected = reach.point(lambda p: 255 if p == FILL_MARK else 0)
 
-        # Anywhere the soft ramp wanted to cut (alpha < 255) but that pixel
-        # isn't part of the border-connected background blob, force it back
-        # to fully opaque — it's a false positive (highlight/logo), not
-        # actual background.
-        isolated = ImageChops.subtract(bg_candidate, border_connected)
-        soft_alpha = ImageChops.lighter(soft_alpha, isolated)
+        # Invert to get product mask (255 for product, 0 for background)
+        product_mask = border_connected.point(lambda p: 0 if p == 255 else 255)
 
-        # Final light feather for a clean anti-aliased edge.
-        soft_alpha = soft_alpha.filter(ImageFilter.GaussianBlur(0.6))
+        # Feather the product mask to get smooth edges
+        product_mask_feathered = product_mask.filter(ImageFilter.GaussianBlur(1.2))
 
-        transparent_ratio = ImageStat.Stat(soft_alpha.point(lambda p: 255 - p)).sum[0] / 255 / (width * height)
+        transparent_ratio = ImageStat.Stat(product_mask_feathered.point(lambda p: 255 - p)).sum[0] / 255 / (width * height)
         if not (0.02 <= transparent_ratio <= 0.92):
             # Background estimate looks wrong (near-zero or near-total
             # removal) — keep the original image opaque rather than risk
@@ -1251,7 +1233,7 @@ def remove_white_background(img_data: bytes) -> tuple[bytes, bool]:
             return out.getvalue(), False
 
         _, _, _, a = img.split()
-        new_a = ImageChops.darker(a, soft_alpha)
+        new_a = ImageChops.darker(a, product_mask_feathered)
         img.putalpha(new_a)
 
         # Crop to the bounding box of non-transparent content to remove empty padding/margins
@@ -1344,7 +1326,8 @@ def migrate_existing_photos():
 def get_photo_path(device_name: str) -> str | None:
     if not device_name:
         return None
-    s = slug(device_name)
+    cleaned = _clean_device_name(device_name)
+    s = slug(cleaned)
     for ext in ("png", "jpg", "webp", "jpeg"):
         p = PHOTOS_DIR / f"{s}.{ext}"
         if p.exists() and p.stat().st_size > 500:
@@ -1376,15 +1359,16 @@ def fetch_photo_for_device(device_name: str):
     named <slugified-device-name>.<png|jpg|webp> will be picked up
     automatically.
     """
-    if not device_name or get_photo_path(device_name):
+    cleaned = _clean_device_name(device_name)
+    if not cleaned or get_photo_path(cleaned):
         return
     with _photo_fetch_lock:
-        if get_photo_path(device_name):
+        if get_photo_path(cleaned):
             return
-        urls = [u for u in _search_device_image_urls(device_name) if _is_safe_image_url(u)]
+        urls = [u for u in _search_device_image_urls(cleaned) if _is_safe_image_url(u)]
         if not urls:
             return
-        dest = PHOTOS_DIR / f"{slug(device_name)}.png"
+        dest = PHOTOS_DIR / f"{slug(cleaned)}.png"
         MAX_BYTES = 8 * 1024 * 1024
         fallback = None
         # Try candidates in best-match order — search-result CDN links
